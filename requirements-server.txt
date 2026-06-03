@@ -1,0 +1,10 @@
+sentence-transformers>=3.0.0
+torch>=2.2.0
+transformers>=4.40.0
+huggingface-hub>=0.23.0
+turbovec>=0.1.0
+numpy>=1.26.0
+openai>=1.30.0
+python-dotenv>=1.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

@@ -1,0 +1,14 @@
+# Don't commit huge stuff
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Local-only PDFs (you parse them on your laptop, ship the result)
+docs/
+
+# Misc
+.DS_Store
+*.log
+.vscode/
+.idea/

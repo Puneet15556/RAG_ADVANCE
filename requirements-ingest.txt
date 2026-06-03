@@ -1,0 +1,30 @@
+# =========================================================
+# INGEST-ONLY requirements (runs on your laptop / GPU server)
+# Used by: python pipeline.py ingest
+# Install: pip install -r requirements-ingest.txt
+# =========================================================
+
+# ---------- Document parsing ----------
+# Pick ONE of these PDF parsers (Docling = best, pypdf = lightest)
+docling>=2.0.0                # SOTA quality, ~2.5 GB ML models
+# marker-pdf>=0.2.0           # Alternative: faster, ~1 GB
+pypdf>=4.0.0                  # Fallback / simple PDFs
+
+# ---------- Chunking ----------
+langchain>=0.2.0
+langchain-text-splitters>=0.2.0
+tiktoken>=0.7.0
+
+# ---------- Embedding (also needed for querying, included below) ----------
+sentence-transformers>=3.0.0
+torch>=2.2.0
+transformers>=4.40.0
+huggingface-hub>=0.23.0
+
+# ---------- Vector index builder ----------
+turbovec>=0.1.0
+
+# ---------- Data layer ----------
+numpy>=1.26.0
+pandas>=2.2.0
+pyarrow>=15.0.0
