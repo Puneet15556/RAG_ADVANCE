@@ -397,6 +397,7 @@
       <span>RAG Chat</span>
     </div>
     <div style="display:flex; align-items:center; gap:12px;">
+      <button id="newChat" class="theme-picker" title="Start a new conversation">+ New chat</button>
       <select id="themePicker" class="theme-picker" title="Change theme">
         <option value="claude">☀ Claude warm</option>
         <option value="purple">🟣 Purple gradient</option>
@@ -441,6 +442,7 @@ const input   = document.getElementById('q');
 const send    = document.getElementById('send');
 const status  = document.getElementById('status');
 const themePicker = document.getElementById('themePicker');
+const newChatBtn  = document.getElementById('newChat');
 
 // ─── Theme switcher (persisted via localStorage) ─────────────────
 const savedTheme = localStorage.getItem('rag_theme') || 'claude';
@@ -449,6 +451,85 @@ themePicker.value = savedTheme;
 themePicker.addEventListener('change', (e) => {
   document.documentElement.setAttribute('data-theme', e.target.value);
   localStorage.setItem('rag_theme', e.target.value);
+});
+
+// ─── Conversation memory (localStorage-backed) ───────────────────
+const MEM_KEY = 'rag_conversation';
+const SUMMARIZE_AFTER = 8;   // when raw history exceeds this many messages, summarize the oldest
+const KEEP_RECENT     = 4;   // keep this many most-recent messages verbatim
+
+let memory = {
+  messages: [],   // [{role:'user'|'assistant', content:'...'}]
+  summary:  '',
+};
+
+function loadMemory() {
+  try {
+    const raw = localStorage.getItem(MEM_KEY);
+    if (raw) memory = JSON.parse(raw);
+  } catch { memory = { messages: [], summary: '' }; }
+}
+
+function saveMemory() {
+  localStorage.setItem(MEM_KEY, JSON.stringify(memory));
+}
+
+function clearMemory() {
+  memory = { messages: [], summary: '' };
+  localStorage.removeItem(MEM_KEY);
+}
+
+async function maybeSummarize() {
+  if (memory.messages.length <= SUMMARIZE_AFTER) return;
+  const toSummarize = memory.messages.slice(0, memory.messages.length - KEEP_RECENT);
+  const recent      = memory.messages.slice(memory.messages.length - KEEP_RECENT);
+  try {
+    const r = await fetch(API + '/summarize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: toSummarize, previous_summary: memory.summary }),
+    });
+    if (!r.ok) return;
+    const { summary } = await r.json();
+    memory.summary  = summary;
+    memory.messages = recent;
+    saveMemory();
+  } catch {/* network blip - skip compression, keep going */}
+}
+
+// ─── Restore previous conversation on page load ──────────────────
+loadMemory();
+function rehydrate() {
+  if (!memory.messages.length) return;
+  if (empty) empty.remove();
+  for (const m of memory.messages) {
+    if (m.role === 'user') {
+      const el = document.createElement('div');
+      el.className = 'msg user';
+      el.innerHTML = `<div class="bubble"></div>`;
+      el.querySelector('.bubble').textContent = m.content;
+      chat.appendChild(el);
+    } else {
+      const el = document.createElement('div');
+      el.className = 'msg bot';
+      el.innerHTML = `<div class="content"></div>`;
+      el.querySelector('.content').innerHTML = marked.parse(m.content);
+      chat.appendChild(el);
+    }
+  }
+  setTimeout(() => { chat.scrollTop = chat.scrollHeight; }, 0);
+}
+rehydrate();
+
+// ─── New chat button: clear history + reset UI ───────────────────
+newChatBtn.addEventListener('click', () => {
+  if (memory.messages.length && !confirm('Start a new conversation? Current history will be cleared.')) return;
+  clearMemory();
+  chat.innerHTML = `
+    <div class="empty" id="empty">
+      <div class="big">Ask your documents</div>
+      <div>Hybrid retrieval + grounded answers with citations.</div>
+    </div>`;
 });
 
 // ─── API health check ────────────────────────────────────────────
@@ -545,7 +626,16 @@ async function streamAnswer(query, msgEl) {
   let sources      = [];
 
   try {
-    const res = await fetch(API + '/answer/stream?q=' + encodeURIComponent(query));
+    const res = await fetch(API + '/answer/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        q:       query,
+        top_k:   5,
+        history: memory.messages,   // last few turns of this conversation
+        summary: memory.summary,    // compressed older turns
+      }),
+    });
     if (!res.ok) throw new Error('HTTP ' + res.status);
 
     const reader  = res.body.getReader();
@@ -579,6 +669,11 @@ async function streamAnswer(query, msgEl) {
 
     const total = (performance.now() - t0) / 1000;
     finalizeBot(msgEl, answer, firstTokenAt || total, total, sources);
+
+    // Persist this turn + maybe compress older history
+    memory.messages.push({ role: 'assistant', content: answer });
+    saveMemory();
+    maybeSummarize();
   } catch (e) {
     msgEl.querySelector('.content').innerHTML =
       `<span style="color:#cf6464">Error: ${e.message}</span>`;
@@ -594,8 +689,11 @@ async function handleSend() {
   send.disabled = true;
 
   addUserMessage(q);
-  const botEl = addBotMessage();
+  // Save user turn BEFORE streaming, so memory stays consistent if user reloads mid-stream
+  memory.messages.push({ role: 'user', content: q });
+  saveMemory();
 
+  const botEl = addBotMessage();
   await streamAnswer(q, botEl);
   send.disabled = false;
   input.focus();

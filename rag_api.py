@@ -2,50 +2,47 @@
 FastAPI wrapper around rag.py / pipeline.py.
 
 - Loads models ONCE at startup (warm pool, no per-request reload).
-- /search   -> full retrieval results (text + source + page + score)
-- /answer   -> only the LLM answer; book names are returned separately so the
-               frontend can hide them behind a "Show sources" button.
-- /         -> minimal browser UI demonstrating the show/hide-sources flow.
+- /search           -> full retrieval results (text + source + page + score)
+- /answer           -> non-streaming JSON answer + book names
+- /answer/stream    -> Server-Sent Events: token-by-token streaming  ⭐
+- /                 -> browser UI that consumes the streaming endpoint
 
 Install:
-    pip install fastapi uvicorn
+    pip install fastapi uvicorn python-dotenv
 
-Set your LLM key:
-    $env:OPENAI_API_KEY = "sk-..."
+.env file (next to this file):
+    GROQ_API_KEY=gsk_...
 
 Run:
     uvicorn rag_api:app --host 0.0.0.0 --port 8000
 
 Open:
-    http://localhost:8000/         (browser UI)
-    http://localhost:8000/docs     (Swagger API explorer)
-    
-    
+    http://localhost:8000/
 """
 
 from __future__ import annotations
-import rag as core
+
+import os
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from re import sub as re_sub, DOTALL as RE_DOTALL
 from typing import List
-import json
 
-
-from re import sub as re_sub, DOTALL as RE_DOTALL                              
-
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
-from pydantic import BaseModel
-import os
 from openai import OpenAI
-from dotenv import load_dotenv
+from pydantic import BaseModel
 
+# Load .env first (so GROQ_API_KEY is available)
 load_dotenv()
 
-
-
-
-
+# Import existing pipeline logic - works for both rag.py and pipeline.py
+try:
+    import rag as core
+except ImportError:
+    import pipeline as core
 
 
 # ===================================================================
@@ -73,6 +70,7 @@ _groq = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 
+
 # ===================================================================
 # RESPONSE MODELS
 # ===================================================================
@@ -85,7 +83,7 @@ class SearchHit(BaseModel):
 
 class AnswerResponse(BaseModel):
     answer:  str
-    sources: List[str]    # unique book names; hidden in UI until user clicks
+    sources: List[str]
 
 
 # ===================================================================
@@ -95,22 +93,42 @@ def _unique_book_names(ranked) -> List[str]:
     """Deduplicated list of book filenames from a ranked result set."""
     seen: list[str] = []
     for hit, _score in ranked:
-        name = Path(hit[2]).name           # hit = (rowid, text, source, page, doc_id)
+        name = Path(hit[2]).name
         if name not in seen:
             seen.append(name)
     return seen
 
 
-def _build_answer_prompt(query: str, ranked) -> str:
+def _build_answer_prompt(
+    query: str,
+    ranked,
+    history: list[dict] | None = None,
+    summary: str | None = None,
+) -> str:
+    """Build prompt with optional conversation history + rolling summary."""
     context = "\n\n".join(
         f"[{i}] {hit[1]}" for i, (hit, _score) in enumerate(ranked, 1)
     )
+
+    convo_block = ""
+    if summary:
+        convo_block += f"\n[Earlier conversation summary]\n{summary}\n"
+    if history:
+        convo_block += "\n[Recent conversation]\n"
+        for msg in history:
+            role = "User" if msg.get("role") == "user" else "Assistant"
+            convo_block += f"{role}: {msg.get('content', '')}\n"
+
     return (
-        "Answer the question using ONLY the context below. "
+        "You are answering a follow-up question in an ongoing conversation. "
+        "Use ONLY the document context below for factual claims; you may use "
+        "the conversation history to understand what is being asked. "
         "Be concise. Use markdown formatting (bold, bullets) where helpful. "
-        "If the context does not contain the answer, say so honestly.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {query}\n\nAnswer:"
+        "Cite documents inline with [number] tags. "
+        "If the context does not contain the answer, say so honestly."
+        f"{convo_block}\n"
+        f"\n[Document context]\n{context}\n\n"
+        f"User: {query}\nAssistant:"
     )
 
 
@@ -131,6 +149,47 @@ def _call_llm(prompt: str) -> str:
     return _clean(response.choices[0].message.content or "").strip()
 
 
+# ───── Conditional query rewriting (fixes "he/she/this" follow-ups) ─────
+_PRONOUNS = {
+    "he", "she", "it", "they", "this", "that", "those", "these",
+    "him", "her", "them", "his", "their", "its", "theirs",
+}
+
+
+def _needs_rewrite(query: str, history: list) -> bool:
+    """Cheap heuristic: rewrite only when query is likely context-dependent."""
+    if not history:
+        return False
+    words = set(query.lower().replace("?", "").replace(".", "").split())
+    if words & _PRONOUNS:
+        return True
+    if len(query.split()) < 5:        # very short follow-up like "and Toda?"
+        return True
+    return False
+
+
+def _rewrite_query(query: str, history: list) -> str:
+    """Use the LLM to make a follow-up question retrieval-friendly."""
+    history_text = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in history[-4:]          # last 2 turns is enough context
+    )
+    prompt = (
+        "Given the conversation below, rewrite the user's latest question "
+        "as a standalone question that includes all necessary context. "
+        "Replace pronouns (he/she/it/they/this/that) and vague references "
+        "with the actual names/entities from the conversation. "
+        "If the question is already standalone, return it unchanged. "
+        "Return ONLY the rewritten question on one line, nothing else.\n\n"
+        f"Conversation:\n{history_text}\n\n"
+        f"Latest question: {query}\n\n"
+        "Standalone question:"
+    )
+    rewritten = _call_llm(prompt).strip().strip('"').strip("'")
+    # Safety: if model returned empty/garbage, fall back to original
+    return rewritten if rewritten else query
+
+
 def _stream_llm(prompt: str):
     """Generator yielding LLM tokens one chunk at a time."""
     response = _groq.chat.completions.create(
@@ -145,23 +204,18 @@ def _stream_llm(prompt: str):
             yield token
 
 
-        
-
-
 # ===================================================================
 # ENDPOINTS
 # ===================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model": LLM_MODEL}
 
 
 @app.get("/search", response_model=List[SearchHit])
 def search_endpoint(q: str, top_k: int = 5):
-    """Full retrieval: top-K reranked chunks with text + metadata."""
     if not q.strip():
         raise HTTPException(400, "empty query")
-
     ranked = core.search(q, top_k=top_k, verbose=False)
     return [
         SearchHit(
@@ -187,23 +241,38 @@ def answer_endpoint(q: str, top_k: int = 5):
         answer=_call_llm(prompt),
         sources=_unique_book_names(ranked),
     )
-    
 
 
-@app.get("/answer/stream")
-def answer_stream_endpoint(q: str, top_k: int = 5):
+class ChatMessage(BaseModel):
+    role:    str          # "user" or "assistant"
+    content: str
+
+
+class StreamRequest(BaseModel):
+    q:       str
+    top_k:   int                       = 5
+    history: List[ChatMessage]         = []
+    summary: str                       = ""
+
+
+@app.post("/answer/stream")
+def answer_stream_endpoint(body: StreamRequest):
     """
-    Streaming: sends tokens as Server-Sent Events.
-
-    Event format:
-        data: {"type": "token", "text": "..."}\\n\\n
-        data: {"type": "sources", "sources": [...]}\\n\\n
-        data: [DONE]\\n\\n
+    Streaming with conversation memory.
+    Body: { q, top_k, history: [{role, content}, ...], summary }
     """
-    if not q.strip():
+    q = body.q.strip()
+    if not q:
         raise HTTPException(400, "empty query")
 
-    ranked = core.search(q, top_k=top_k, verbose=False)
+    # ── History-aware retrieval: rewrite if the query depends on context ──
+    history = [m.model_dump() for m in body.history]
+    search_q = q
+    if _needs_rewrite(q, history):
+        search_q = _rewrite_query(q, history)
+        print(f"[rewrite] '{q}'  ->  '{search_q}'")
+
+    ranked = core.search(search_q, top_k=body.top_k, verbose=False)
     if not ranked:
         def empty():
             yield 'data: {"type":"token","text":"No relevant documents found."}\n\n'
@@ -211,15 +280,15 @@ def answer_stream_endpoint(q: str, top_k: int = 5):
         return StreamingResponse(empty(), media_type="text/event-stream")
 
     sources = _unique_book_names(ranked)
-    prompt  = _build_answer_prompt(q, ranked)
+    # NOTE: send the ORIGINAL question to the LLM, not the rewritten one.
+    # Rewrite only existed to help retrieval; the user-facing prompt stays natural.
+    prompt  = _build_answer_prompt(q, ranked, history=history, summary=body.summary)
 
     def event_stream():
-        # Stream LLM tokens (clean each one cheaply on the way out)
         for token in _stream_llm(prompt):
             cleaned = _clean(token)
             if cleaned:
                 yield f"data: {json.dumps({'type':'token','text':cleaned})}\n\n"
-        # After completion, send the source list
         yield f"data: {json.dumps({'type':'sources','sources':sources})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -228,7 +297,33 @@ def answer_stream_endpoint(q: str, top_k: int = 5):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    
+
+
+class SummarizeRequest(BaseModel):
+    messages:         List[ChatMessage]
+    previous_summary: str = ""
+
+
+@app.post("/summarize")
+def summarize_endpoint(body: SummarizeRequest):
+    """Compress old chat turns into a brief summary."""
+    if not body.messages:
+        return {"summary": body.previous_summary}
+
+    lines = [f"{m.role.capitalize()}: {m.content}" for m in body.messages]
+    convo = "\n".join(lines)
+
+    prompt = (
+        "Summarize the following conversation in 2-4 sentences. "
+        "Preserve key facts, entities, and the user's apparent interests. "
+        "Be neutral and concise.\n\n"
+    )
+    if body.previous_summary:
+        prompt += f"Previous summary:\n{body.previous_summary}\n\nNew turns to incorporate:\n{convo}\n\nUpdated summary:"
+    else:
+        prompt += f"Conversation:\n{convo}\n\nSummary:"
+
+    return {"summary": _call_llm(prompt)}
 
 
 # ===================================================================
