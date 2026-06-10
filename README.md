@@ -6,7 +6,7 @@ Built end-to-end: **document parsing → chunking → embedding → hybrid retri
 > Engineered as a portfolio piece to demonstrate AI-architecture decisions, not as a wrapper around a managed API. Every layer was picked with explicit trade-offs in mind.
 
 ---
-## 🤗 [Live Demo on Hugging Face Spaces](https://huggingface.co/spaces/Puneet666/RAG_ADVANCE) · Running on free-tier CPU · 
+## 🤗 Live Demo on Hugging Face Spaces - " https://puneet666-rag-advance.hf.space/ "  Running on free-tier CPU · 
 
 ## 🧩 Architecture
 
