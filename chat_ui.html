@@ -347,6 +347,74 @@
     }
     .theme-picker:hover { color: var(--text); border-color: var(--accent); }
     .theme-picker:focus { outline: none; border-color: var(--accent); }
+
+    /* ───────── SIDEBAR (multi-chat history) ───────── */
+    .layout { display: flex; height: 100vh; }
+    .sidebar {
+      width: 240px; flex-shrink: 0;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      padding: 14px 10px;
+      transition: transform 0.2s;
+    }
+    .sidebar h3 {
+      margin: 8px 6px 12px;
+      font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-faint);
+    }
+    .sidebar-new {
+      background: var(--accent); color: white;
+      border: none; border-radius: 8px;
+      padding: 8px 12px; font-family: inherit; font-size: 13px;
+      cursor: pointer; font-weight: 500;
+      transition: background 0.15s;
+      margin-bottom: 14px;
+    }
+    .sidebar-new:hover { background: var(--accent-hover); }
+    .chat-list { flex: 1; overflow-y: auto; }
+    .chat-list::-webkit-scrollbar { width: 4px; }
+    .chat-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .chat-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 7px 9px; margin-bottom: 2px;
+      border-radius: 8px; cursor: pointer;
+      transition: background 0.1s;
+      font-size: 13px; color: var(--text-muted);
+    }
+    .chat-row:hover { background: var(--surface-2); color: var(--text); }
+    .chat-row.active { background: var(--user-bg); color: var(--text); font-weight: 500; }
+    .chat-row .chat-title {
+      flex: 1; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .chat-row .del-btn {
+      background: transparent; border: none;
+      color: var(--text-faint); cursor: pointer;
+      font-size: 16px; line-height: 1; padding: 2px 6px;
+      opacity: 0; transition: opacity 0.15s;
+      border-radius: 4px;
+    }
+    .chat-row:hover .del-btn { opacity: 1; }
+    .chat-row .del-btn:hover { background: var(--border); color: var(--text); }
+
+    /* Mobile: hide sidebar by default, toggle with hamburger */
+    .sidebar-toggle {
+      display: none;
+      background: var(--surface-2); color: var(--text-muted);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 6px 10px; cursor: pointer; font-size: 14px;
+    }
+    @media (max-width: 720px) {
+      .sidebar {
+        position: fixed; left: 0; top: 0; bottom: 0; z-index: 10;
+        transform: translateX(-100%);
+        box-shadow: 4px 0 16px rgba(0,0,0,0.15);
+      }
+      .sidebar.open { transform: translateX(0); }
+      .sidebar-toggle { display: inline-flex; }
+    }
     .input-row {
       display: flex; gap: 8px; align-items: flex-end;
       background: var(--surface);
@@ -389,15 +457,23 @@
 </head>
 <body>
 
+<div class="layout">
+
+<aside class="sidebar" id="sidebar">
+  <button class="sidebar-new" id="newChatSide">+ New chat</button>
+  <h3>Past conversations</h3>
+  <div class="chat-list" id="chatList"></div>
+</aside>
+
 <div class="app">
 
   <header>
     <div class="title">
+      <button class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar">☰</button>
       <div class="logo">R</div>
       <span>RAG Chat</span>
     </div>
     <div style="display:flex; align-items:center; gap:12px;">
-      <button id="newChat" class="theme-picker" title="Start a new conversation">+ New chat</button>
       <select id="themePicker" class="theme-picker" title="Change theme">
         <option value="claude">☀ Claude warm</option>
         <option value="purple">🟣 Purple gradient</option>
@@ -433,16 +509,19 @@
 
 </div>
 
+</div>
 
 <script>
 const API     = '';                    // same origin
 const chat    = document.getElementById('chat');
-const empty   = document.getElementById('empty');
 const input   = document.getElementById('q');
 const send    = document.getElementById('send');
 const status  = document.getElementById('status');
 const themePicker = document.getElementById('themePicker');
-const newChatBtn  = document.getElementById('newChat');
+const sidebar       = document.getElementById('sidebar');
+const sidebarToggle = document.getElementById('sidebarToggle');
+const newChatSide   = document.getElementById('newChatSide');
+const chatList      = document.getElementById('chatList');
 
 // ─── Theme switcher (persisted via localStorage) ─────────────────
 const savedTheme = localStorage.getItem('rag_theme') || 'claude';
@@ -453,56 +532,91 @@ themePicker.addEventListener('change', (e) => {
   localStorage.setItem('rag_theme', e.target.value);
 });
 
-// ─── Conversation memory (localStorage-backed) ───────────────────
-const MEM_KEY = 'rag_conversation';
-const SUMMARIZE_AFTER = 8;   // when raw history exceeds this many messages, summarize the oldest
-const KEEP_RECENT     = 4;   // keep this many most-recent messages verbatim
+// ─── Multi-conversation memory (localStorage-backed) ─────────────
+const CHATS_KEY      = 'rag_all_chats';
+const CURRENT_KEY    = 'rag_current_chat';
+const SUMMARIZE_AFTER = 8;
+const KEEP_RECENT     = 4;
 
-let memory = {
-  messages: [],   // [{role:'user'|'assistant', content:'...'}]
-  summary:  '',
-};
+let allChats = {};
+let currentChatId = null;
 
-function loadMemory() {
+function loadAll() {
   try {
-    const raw = localStorage.getItem(MEM_KEY);
-    if (raw) memory = JSON.parse(raw);
-  } catch { memory = { messages: [], summary: '' }; }
+    allChats = JSON.parse(localStorage.getItem(CHATS_KEY) || '{}');
+    currentChatId = localStorage.getItem(CURRENT_KEY) || null;
+    if (!currentChatId || !allChats[currentChatId]) {
+      const ids = Object.keys(allChats);
+      currentChatId = ids[0] || null;
+    }
+  } catch { allChats = {}; currentChatId = null; }
+}
+function saveAll() {
+  localStorage.setItem(CHATS_KEY, JSON.stringify(allChats));
+  localStorage.setItem(CURRENT_KEY, currentChatId || '');
+}
+function current() { return currentChatId ? allChats[currentChatId] : null; }
+
+function newChat() {
+  const id = 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  allChats[id] = {
+    id, title: 'New chat',
+    messages: [], summary: '',
+    createdAt: Date.now(), lastActive: Date.now(),
+  };
+  currentChatId = id;
+  saveAll();
+  renderSidebar();
+  renderEmptyChat();
 }
 
-function saveMemory() {
-  localStorage.setItem(MEM_KEY, JSON.stringify(memory));
+function deleteChat(id) {
+  delete allChats[id];
+  if (currentChatId === id) currentChatId = Object.keys(allChats)[0] || null;
+  saveAll();
+  if (!currentChatId) newChat();
+  else { renderSidebar(); rehydrate(); }
 }
 
-function clearMemory() {
-  memory = { messages: [], summary: '' };
-  localStorage.removeItem(MEM_KEY);
+function switchChat(id) {
+  if (!allChats[id]) return;
+  currentChatId = id;
+  saveAll();
+  renderSidebar();
+  rehydrate();
+  if (window.innerWidth <= 720) sidebar.classList.remove('open');
 }
 
-async function maybeSummarize() {
-  if (memory.messages.length <= SUMMARIZE_AFTER) return;
-  const toSummarize = memory.messages.slice(0, memory.messages.length - KEEP_RECENT);
-  const recent      = memory.messages.slice(memory.messages.length - KEEP_RECENT);
-  try {
-    const r = await fetch(API + '/summarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: toSummarize, previous_summary: memory.summary }),
-    });
-    if (!r.ok) return;
-    const { summary } = await r.json();
-    memory.summary  = summary;
-    memory.messages = recent;
-    saveMemory();
-  } catch {/* network blip - skip compression, keep going */}
+function renderSidebar() {
+  chatList.innerHTML = '';
+  const sorted = Object.values(allChats).sort((a, b) => b.lastActive - a.lastActive);
+  for (const c of sorted) {
+    const row = document.createElement('div');
+    row.className = 'chat-row' + (c.id === currentChatId ? ' active' : '');
+    row.innerHTML = `<span class="chat-title"></span><button class="del-btn" title="Delete">×</button>`;
+    row.querySelector('.chat-title').textContent = c.title || 'New chat';
+    row.querySelector('.chat-title').onclick = () => switchChat(c.id);
+    row.querySelector('.del-btn').onclick = (e) => {
+      e.stopPropagation();
+      if (confirm(`Delete "${c.title}"?`)) deleteChat(c.id);
+    };
+    chatList.appendChild(row);
+  }
 }
 
-// ─── Restore previous conversation on page load ──────────────────
-loadMemory();
+function renderEmptyChat() {
+  chat.innerHTML = `
+    <div class="empty">
+      <div class="big">Ask your documents</div>
+      <div>Hybrid retrieval + grounded answers with citations.</div>
+    </div>`;
+}
+
 function rehydrate() {
-  if (!memory.messages.length) return;
-  if (empty) empty.remove();
-  for (const m of memory.messages) {
+  const c = current();
+  if (!c || !c.messages.length) { renderEmptyChat(); return; }
+  chat.innerHTML = '';
+  for (const m of c.messages) {
     if (m.role === 'user') {
       const el = document.createElement('div');
       el.className = 'msg user';
@@ -519,18 +633,34 @@ function rehydrate() {
   }
   setTimeout(() => { chat.scrollTop = chat.scrollHeight; }, 0);
 }
-rehydrate();
 
-// ─── New chat button: clear history + reset UI ───────────────────
-newChatBtn.addEventListener('click', () => {
-  if (memory.messages.length && !confirm('Start a new conversation? Current history will be cleared.')) return;
-  clearMemory();
-  chat.innerHTML = `
-    <div class="empty" id="empty">
-      <div class="big">Ask your documents</div>
-      <div>Hybrid retrieval + grounded answers with citations.</div>
-    </div>`;
-});
+async function maybeSummarize() {
+  const c = current(); if (!c) return;
+  if (c.messages.length <= SUMMARIZE_AFTER) return;
+  const toSummarize = c.messages.slice(0, c.messages.length - KEEP_RECENT);
+  const recent      = c.messages.slice(c.messages.length - KEEP_RECENT);
+  try {
+    const r = await fetch(API + '/summarize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: toSummarize, previous_summary: c.summary }),
+    });
+    if (!r.ok) return;
+    const { summary } = await r.json();
+    c.summary  = summary;
+    c.messages = recent;
+    saveAll();
+  } catch {/* network blip */}
+}
+
+// ─── Initial load ────────────────────────────────────────────────
+loadAll();
+if (!currentChatId) newChat();
+else { renderSidebar(); rehydrate(); }
+
+// Sidebar toggle (mobile)
+sidebarToggle.addEventListener('click', () => sidebar.classList.toggle('open'));
+newChatSide.addEventListener('click', newChat);
 
 // ─── API health check ────────────────────────────────────────────
 fetch(API + '/health')
@@ -553,6 +683,7 @@ function scrollDown() {
 }
 
 function addUserMessage(text) {
+  const empty = chat.querySelector('.empty');
   if (empty) empty.remove();
   const el = document.createElement('div');
   el.className = 'msg user';
@@ -626,14 +757,15 @@ async function streamAnswer(query, msgEl) {
   let sources      = [];
 
   try {
+    const c = current();
     const res = await fetch(API + '/answer/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         q:       query,
         top_k:   5,
-        history: memory.messages,   // last few turns of this conversation
-        summary: memory.summary,    // compressed older turns
+        history: c ? c.messages : [],
+        summary: c ? c.summary  : '',
       }),
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -671,9 +803,14 @@ async function streamAnswer(query, msgEl) {
     finalizeBot(msgEl, answer, firstTokenAt || total, total, sources);
 
     // Persist this turn + maybe compress older history
-    memory.messages.push({ role: 'assistant', content: answer });
-    saveMemory();
-    maybeSummarize();
+    const c2 = current();
+    if (c2) {
+      c2.messages.push({ role: 'assistant', content: answer });
+      c2.lastActive = Date.now();
+      saveAll();
+      renderSidebar();
+      maybeSummarize();
+    }
   } catch (e) {
     msgEl.querySelector('.content').innerHTML =
       `<span style="color:#cf6464">Error: ${e.message}</span>`;
@@ -689,9 +826,17 @@ async function handleSend() {
   send.disabled = true;
 
   addUserMessage(q);
-  // Save user turn BEFORE streaming, so memory stays consistent if user reloads mid-stream
-  memory.messages.push({ role: 'user', content: q });
-  saveMemory();
+  // Save user turn + auto-title chat from first question
+  const c = current();
+  if (c) {
+    c.messages.push({ role: 'user', content: q });
+    c.lastActive = Date.now();
+    if (c.title === 'New chat') {
+      c.title = q.length > 40 ? q.slice(0, 40) + '…' : q;
+    }
+    saveAll();
+    renderSidebar();
+  }
 
   const botEl = addBotMessage();
   await streamAnswer(q, botEl);

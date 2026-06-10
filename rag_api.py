@@ -120,12 +120,17 @@ def _build_answer_prompt(
             convo_block += f"{role}: {msg.get('content', '')}\n"
 
     return (
-        "You are answering a follow-up question in an ongoing conversation. "
-        "Use ONLY the document context below for factual claims; you may use "
-        "the conversation history to understand what is being asked. "
-        "Be concise. Use markdown formatting (bold, bullets) where helpful. "
-        "Cite documents inline with [number] tags. "
-        "If the context does not contain the answer, say so honestly."
+        "You answer a question grounded ONLY in the document context below.\n\n"
+        "STRICT RULES:\n"
+        "1. Every factual claim MUST come from the [Document context]. "
+        "   Do NOT use general knowledge, training data, or guesses.\n"
+        "2. If the answer is not in the documents, reply with exactly: "
+        "   'The documents don't cover that.' and stop. Do NOT speculate.\n"
+        "3. Cite documents inline with [number] tags - only for claims "
+        "   actually backed by that chunk.\n"
+        "4. You may use the conversation history to understand what is "
+        "   being asked, but never to invent facts.\n"
+        "5. Be concise. Use markdown (bold, bullets) where it helps."
         f"{convo_block}\n"
         f"\n[Document context]\n{context}\n\n"
         f"User: {query}\nAssistant:"
@@ -172,21 +177,25 @@ def _rewrite_query(query: str, history: list) -> str:
     """Use the LLM to make a follow-up question retrieval-friendly."""
     history_text = "\n".join(
         f"{m['role'].capitalize()}: {m['content']}"
-        for m in history[-4:]          # last 2 turns is enough context
+        for m in history[-4:]
     )
     prompt = (
-        "Given the conversation below, rewrite the user's latest question "
-        "as a standalone question that includes all necessary context. "
-        "Replace pronouns (he/she/it/they/this/that) and vague references "
-        "with the actual names/entities from the conversation. "
-        "If the question is already standalone, return it unchanged. "
-        "Return ONLY the rewritten question on one line, nothing else.\n\n"
+        "You rewrite follow-up questions so retrieval can find the right docs.\n\n"
+        "RULES:\n"
+        "1. Replace pronouns (he/she/him/her/they/this/that) with explicit names.\n"
+        "2. PREFER the person or entity the USER most recently asked about, "
+        "   NOT a name that only appeared inside the assistant's reply.\n"
+        "3. If the user's last question was 'Tell me about X' and the next "
+        "   says 'when did he die' - rewrite using X, even if the assistant's "
+        "   answer mentioned other people.\n"
+        "4. If the question is already standalone, return it unchanged.\n"
+        "5. Return ONLY the rewritten question on one line. No preamble, "
+        "   no quotes, no explanation.\n\n"
         f"Conversation:\n{history_text}\n\n"
         f"Latest question: {query}\n\n"
         "Standalone question:"
     )
     rewritten = _call_llm(prompt).strip().strip('"').strip("'")
-    # Safety: if model returned empty/garbage, fall back to original
     return rewritten if rewritten else query
 
 
